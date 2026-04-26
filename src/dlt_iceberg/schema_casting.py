@@ -436,6 +436,17 @@ def cast_table_safe(
         f"to schema with {len(target_schema)} fields"
     )
 
+    # Add null columns for any field in the target schema missing from the source.
+    # This handles sparse incoming data where the Iceberg table has columns that
+    # the current batch doesn't contain.
+    source_field_names = {field.name for field in table.schema}
+    for target_field in target_schema:
+        if target_field.name not in source_field_names:
+            table = table.append_column(
+                target_field,
+                pa.nulls(len(table), type=target_field.type),
+            )
+
     # Reorder columns to match target schema before casting
     # PyArrow's cast() requires fields to be in the same order
     target_field_names = [field.name for field in target_schema]

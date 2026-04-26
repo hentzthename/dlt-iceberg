@@ -144,13 +144,6 @@ def validate_schema_changes(
     """
     errors = []
 
-    # Check dropped columns
-    if dropped_fields and not allow_column_drops:
-        errors.append(
-            f"Columns dropped (not safe): {', '.join(dropped_fields)}. "
-            f"Dropping columns is not supported by default to prevent data loss."
-        )
-
     # Check type changes
     for field_name, old_type, new_type in type_changes:
         if not can_promote_type(old_type, new_type):
@@ -169,7 +162,8 @@ def validate_schema_changes(
 def apply_schema_evolution(
     table,
     added_fields: List[NestedField],
-    type_changes: List[Tuple[str, IcebergType, IcebergType]]
+    type_changes: List[Tuple[str, IcebergType, IcebergType]],
+    dropped_fields: Optional[List[str]] = None,
 ) -> None:
     """
     Apply schema evolution changes to an Iceberg table.
@@ -178,14 +172,16 @@ def apply_schema_evolution(
         table: PyIceberg table instance
         added_fields: New fields to add
         type_changes: Type promotions to apply
+        dropped_fields: Fields to remove from the schema
     """
-    if not added_fields and not type_changes:
+    if not added_fields and not type_changes and not dropped_fields:
         logger.info("No schema changes to apply")
         return
 
     logger.info(
         f"Applying schema evolution: "
-        f"{len(added_fields)} new columns, {len(type_changes)} type promotions"
+        f"{len(added_fields)} new columns, {len(type_changes)} type promotions, "
+        f"{len(dropped_fields or [])} dropped columns"
     )
 
     # Apply changes using update_schema transaction
@@ -207,6 +203,11 @@ def apply_schema_evolution(
                 path=field_name,
                 field_type=new_type
             )
+
+        # Delete dropped columns
+        for field_name in (dropped_fields or []):
+            logger.info(f"  Dropping column: {field_name}")
+            update.delete_column(field_name)
 
     logger.info("Schema evolution applied successfully")
 
@@ -245,7 +246,13 @@ def evolve_schema_if_needed(
     if type_changes:
         logger.info(f"Detected {len(type_changes)} type changes: {[(name, str(old), str(new)) for name, old, new in type_changes]}")
     if dropped_fields:
-        logger.warning(f"Detected {len(dropped_fields)} dropped columns: {dropped_fields}")
+        if allow_column_drops:
+            logger.info(f"Detected {len(dropped_fields)} columns to drop: {dropped_fields}")
+        else:
+            logger.warning(
+                f"Detected {len(dropped_fields)} sparse columns (not in incoming data): "
+                f"{dropped_fields}. Columns will remain in schema; new rows will have nulls."
+            )
 
     # If no changes, nothing to do
     if not added_fields and not type_changes and not dropped_fields:
@@ -255,7 +262,15 @@ def evolve_schema_if_needed(
     # Validate changes are safe
     validate_schema_changes(added_fields, type_changes, dropped_fields, allow_column_drops)
 
-    # Apply evolution
-    apply_schema_evolution(table, added_fields, type_changes)
+    # When allow_column_drops=False and only dropped fields were detected,
+    # the table schema is already correct — no evolution needed.
+    if not allow_column_drops and not added_fields and not type_changes:
+        return False
+
+    # Apply evolution, passing dropped_fields only when allow_column_drops=True
+    apply_schema_evolution(
+        table, added_fields, type_changes,
+        dropped_fields=dropped_fields if allow_column_drops else None,
+    )
 
     return True
